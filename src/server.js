@@ -5,146 +5,145 @@ const SOURCE_URL = "https://wtxmd52.tele68.com/v1/txmd5/sessions";
 const PORT = process.env.PORT || 3000;
 const HISTORY_LIMIT = 200;
 
-// ─── Data Store ───────────────────────────────────────────────────────────────
-let history = []; // [{phien, result: [d1,d2,d3], tong, loai}]
+let history = [];
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Fetch raw ────────────────────────────────────────────────────────────────
 function fetchSource() {
   return new Promise((resolve, reject) => {
-    https
-      .get(SOURCE_URL, (res) => {
-        let raw = "";
-        res.on("data", (c) => (raw += c));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(raw));
-          } catch (e) {
-            reject(e);
-          }
-        });
-      })
-      .on("error", reject);
+    const req = https.get(SOURCE_URL, { headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json" } }, (res) => {
+      let raw = "";
+      res.on("data", (c) => (raw += c));
+      res.on("end", () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch (e) { resolve({ status: res.statusCode, rawText: raw.slice(0, 500), parseError: true }); }
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error("timeout")); });
   });
 }
 
-function classify(tong) {
-  // Tài = 11-18, Xỉu = 3-10
-  return tong >= 11 ? "T" : "X";
+// ─── Flexible session extractor ───────────────────────────────────────────────
+function extractSessions(body) {
+  if (!body || typeof body !== "object") return [];
+  const candidates = [
+    body, body.data, body.result, body.results, body.response,
+    body.list, body.items, body.sessions,
+    body.data?.sessions, body.data?.list, body.data?.items, body.data?.data,
+  ];
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length > 0) return c;
+  }
+  if (body.session_id || body.phien || body.id) return [body];
+  return [];
+}
+
+// ─── Parse one session ────────────────────────────────────────────────────────
+function parseSession(s) {
+  if (!s || typeof s !== "object") return null;
+  const phien = s.session_id ?? s.sessionId ?? s.phien ?? s.id ?? s.game_id ?? "?";
+
+  let dice = null;
+  const diceFields = [
+    s.result?.dice, s.dice, s.result?.dices, s.dices,
+    s.result?.result, s.detail?.dice, s.data?.dice,
+  ];
+  for (const f of diceFields) {
+    if (Array.isArray(f) && f.length >= 3) {
+      const d = f.slice(0, 3).map(Number);
+      if (d.every((x) => x >= 1 && x <= 6)) { dice = d; break; }
+    }
+    if (typeof f === "string") {
+      const parts = f.includes(",") ? f.split(",").map(Number) : f.split("").map(Number);
+      if (parts.length >= 3 && parts.every((x) => x >= 1 && x <= 6)) { dice = parts.slice(0, 3); break; }
+    }
+  }
+  // Deep search
+  if (!dice) {
+    for (const key of Object.keys(s)) {
+      const val = s[key];
+      if (val && typeof val === "object") {
+        for (const subkey of Object.keys(val)) {
+          const sub = val[subkey];
+          if (Array.isArray(sub) && sub.length >= 3 && sub.every((x) => Number(x) >= 1 && Number(x) <= 6)) {
+            dice = sub.slice(0, 3).map(Number); break;
+          }
+        }
+        if (dice) break;
+      }
+    }
+  }
+  if (!dice) return null;
+
+  const tong = dice.reduce((a, b) => a + b, 0);
+  let type = null;
+  const txFields = [s.result?.tx, s.tx, s.result?.type, s.type, s.result?.winner, s.winner, s.outcome];
+  for (const f of txFields) {
+    if (typeof f === "string") {
+      const u = f.toUpperCase();
+      if (u.includes("T") || u.includes("BIG") || u.includes("TAI")) { type = "T"; break; }
+      if (u.includes("X") || u.includes("SMALL") || u.includes("XIU")) { type = "X"; break; }
+    }
+  }
+  if (!type) type = tong >= 11 ? "T" : "X";
+
+  return { phien: String(phien), dice, tong, type };
 }
 
 function buildHistory(sessions) {
-  const arr = [];
-  for (const s of sessions) {
-    if (!s.result || !Array.isArray(s.result.dice)) continue;
-    const dice = s.result.dice.slice(0, 3);
-    if (dice.length < 3) continue;
-    const tong = dice.reduce((a, b) => a + b, 0);
-    arr.push({
-      phien: s.session_id ?? s.id ?? s.phien,
-      dice,
-      tong,
-      type: classify(tong),
-    });
-  }
-  return arr.reverse(); // oldest → newest
+  return sessions.map(parseSession).filter(Boolean);
 }
 
 // ─── Pattern Detection ────────────────────────────────────────────────────────
 function detectPattern(seq) {
-  // seq = array of "T"/"X" newest first
+  if (seq.length < 4) return null;
   const s = seq.slice(0, 20).join("");
 
-  // 1. Streak (cầu bệt)
-  const streakMatch = s.match(/^(T+|X+)/);
-  if (streakMatch && streakMatch[0].length >= 3) {
-    return {
-      name: "Bệt",
-      pattern: streakMatch[0],
-      next: streakMatch[0][0],
-      conf: Math.min(0.55 + streakMatch[0].length * 0.04, 0.85),
-    };
+  const streakMatch = s.match(/^(T{3,}|X{3,})/);
+  if (streakMatch) {
+    const len = streakMatch[0].length;
+    return { name: "Bệt " + streakMatch[0][0], pattern: streakMatch[0], next: streakMatch[0][0], conf: Math.min(0.55 + len * 0.04, 0.86) };
   }
 
-  // 2. Alternating 1-1 (cầu 1-1)
-  const alt = s.slice(0, 8);
   let isAlt = true;
-  for (let i = 1; i < alt.length; i++) {
-    if (alt[i] === alt[i - 1]) {
-      isAlt = false;
-      break;
-    }
-  }
-  if (isAlt && alt.length >= 4) {
-    const next = alt[0] === "T" ? "X" : "T";
-    return { name: "Cầu 1-1", pattern: alt, next, conf: 0.72 };
+  const altLen = Math.min(seq.length, 8);
+  for (let i = 1; i < altLen; i++) { if (seq[i] === seq[i - 1]) { isAlt = false; break; } }
+  if (isAlt && altLen >= 4) {
+    return { name: "Cầu 1-1", pattern: s.slice(0, altLen), next: seq[0] === "T" ? "X" : "T", conf: 0.72 };
   }
 
-  // 3. 2-2 pattern
-  if (
-    s.length >= 8 &&
-    s[0] === s[1] &&
-    s[2] === s[3] &&
-    s[0] !== s[2] &&
-    s[4] === s[5] &&
-    s[4] === s[0]
-  ) {
-    const next = s[0] === s[1] ? s[0] : s[2];
-    return { name: "Cầu 2-2", pattern: s.slice(0, 8), next, conf: 0.68 };
-  }
+  if (s.length >= 8 && s[0]===s[1] && s[2]===s[3] && s[0]!==s[2] && s[4]===s[5] && s[4]===s[0])
+    return { name: "Cầu 2-2", pattern: s.slice(0, 8), next: s[0], conf: 0.68 };
 
-  // 4. 3-3 pattern
-  if (
-    s.length >= 6 &&
-    s[0] === s[1] &&
-    s[1] === s[2] &&
-    s[3] === s[4] &&
-    s[4] === s[5] &&
-    s[0] !== s[3]
-  ) {
-    const next = s[0];
-    return { name: "Cầu 3-3", pattern: s.slice(0, 6), next, conf: 0.65 };
-  }
+  if (s.length >= 6 && s[0]===s[1] && s[1]===s[2] && s[3]===s[4] && s[4]===s[5] && s[0]!==s[3])
+    return { name: "Cầu 3-3", pattern: s.slice(0, 6), next: s[0], conf: 0.65 };
 
-  // 5. TXTX / XTXT cầu xen kẽ nhóm
-  const rep2 = s.slice(0, 6);
-  if (rep2 === "TXTXTX" || rep2 === "XTXTXT") {
-    const next = rep2[0] === "T" ? "X" : "T";
-    return { name: "Xen Kẽ", pattern: rep2, next, conf: 0.7 };
-  }
+  if (s.length >= 6 && s[0]!==s[1] && s[1]===s[2] && s[2]!==s[3] && s[3]===s[4])
+    return { name: "Cầu 1-2", pattern: s.slice(0, 6), next: s[0], conf: 0.61 };
 
   return null;
 }
 
-// ─── Statistical Algorithms ───────────────────────────────────────────────────
+// ─── Algorithms ───────────────────────────────────────────────────────────────
 function algoFrequency(seq) {
   const n = Math.min(seq.length, 30);
   const sub = seq.slice(0, n);
   const cntT = sub.filter((x) => x === "T").length;
   const cntX = n - cntT;
-  // Regression to mean
-  if (cntT / n > 0.6)
-    return { next: "X", conf: 0.55 + (cntT / n - 0.5) * 0.4 };
-  if (cntX / n > 0.6)
-    return { next: "T", conf: 0.55 + (cntX / n - 0.5) * 0.4 };
+  if (cntT / n > 0.62) return { next: "X", conf: 0.52 + (cntT / n - 0.5) * 0.5 };
+  if (cntX / n > 0.62) return { next: "T", conf: 0.52 + (cntX / n - 0.5) * 0.5 };
   return null;
 }
 
 function algoMarkov(seq) {
   if (seq.length < 10) return null;
-  // Build 2nd order Markov
-  const trans = { TT: { T: 0, X: 0 }, TX: { T: 0, X: 0 }, XT: { T: 0, X: 0 }, XX: { T: 0, X: 0 } };
-  for (let i = 2; i < seq.length; i++) {
-    const key = seq[i - 1] + seq[i - 2];
-    if (trans[key]) trans[key][seq[i - (i > 0 ? 0 : 0)]] = (trans[key][seq[i - (i > 0 ? 0 : 0)]] || 0);
-  }
-  // Simplified: 1st order
-  const trans1 = { T: { T: 0, X: 0 }, X: { T: 0, X: 0 } };
+  const trans = { T: { T: 0, X: 0 }, X: { T: 0, X: 0 } };
   for (let i = 1; i < seq.length; i++) {
-    trans1[seq[i]][seq[i - 1]] = (trans1[seq[i]][seq[i - 1]] || 0) + 1;
+    if (trans[seq[i]] && trans[seq[i]][seq[i - 1]] !== undefined) trans[seq[i]][seq[i - 1]]++;
   }
   const cur = seq[0];
-  const toT = trans1["T"][cur] || 0;
-  const toX = trans1["X"][cur] || 0;
+  const toT = trans["T"][cur] || 0;
+  const toX = trans["X"][cur] || 0;
   const total = toT + toX;
   if (total < 5) return null;
   if (toT > toX) return { next: "T", conf: 0.5 + (toT / total - 0.5) * 0.6 };
@@ -153,203 +152,142 @@ function algoMarkov(seq) {
 }
 
 function algoLuong(seq) {
-  // Detect "sóng" - wave pattern
   if (seq.length < 6) return null;
   const w = seq.slice(0, 6);
-  // Count transitions
   let trans = 0;
   for (let i = 1; i < w.length; i++) if (w[i] !== w[i - 1]) trans++;
-  if (trans <= 1) return { next: w[0], conf: 0.62 }; // strong streak
-  if (trans >= 5) return { next: w[0] === "T" ? "X" : "T", conf: 0.6 }; // heavy alternating
+  if (trans <= 1) return { next: w[0], conf: 0.62 };
+  if (trans >= 5) return { next: w[0] === "T" ? "X" : "T", conf: 0.6 };
   return null;
 }
 
 function algoDice(hist) {
-  // Analyze raw dice sum distribution
   if (hist.length < 15) return null;
-  const recent = hist.slice(0, 15);
-  const avgSum = recent.reduce((a, b) => a + b.tong, 0) / recent.length;
-  // If avg sum trending low → bias Xỉu, high → Tài
+  const avgSum = hist.slice(0, 15).reduce((a, b) => a + b.tong, 0) / 15;
   if (avgSum < 9.5) return { next: "X", conf: 0.58 };
   if (avgSum > 11.5) return { next: "T", conf: 0.58 };
   return null;
 }
 
-// ─── Ensemble Predictor ───────────────────────────────────────────────────────
+function algoStreak5(seq) {
+  if (seq.length < 5) return null;
+  const last5 = seq.slice(0, 5);
+  if (last5.every((x) => x === last5[0])) return { next: last5[0] === "T" ? "X" : "T", conf: 0.63 };
+  return null;
+}
+
+// ─── Ensemble ─────────────────────────────────────────────────────────────────
 function predict(hist) {
   if (hist.length < 5) return { next: "?", conf: 0, cauType: "Chưa đủ dữ liệu", pattern: "" };
-
-  const seq = hist.map((h) => h.type); // newest first
-
-  const votes = { T: 0, X: 0 };
+  const seq = hist.map((h) => h.type);
   const weights = { T: 0, X: 0 };
-  const details = [];
+  const votes = { T: 0, X: 0 };
 
-  // Pattern detection (weight 3)
+  const add = (algo, w) => {
+    if (!algo) return;
+    votes[algo.next] += w;
+    weights[algo.next] += algo.conf * w;
+  };
+
   const pat = detectPattern(seq);
-  if (pat) {
-    votes[pat.next] += 3;
-    weights[pat.next] += pat.conf * 3;
-    details.push({ src: pat.name, next: pat.next, conf: pat.conf });
-  }
-
-  // Frequency analysis (weight 2)
-  const freq = algoFrequency(seq);
-  if (freq) {
-    votes[freq.next] += 2;
-    weights[freq.next] += freq.conf * 2;
-    details.push({ src: "Tần suất", next: freq.next, conf: freq.conf });
-  }
-
-  // Markov chain (weight 2)
-  const markov = algoMarkov(seq);
-  if (markov) {
-    votes[markov.next] += 2;
-    weights[markov.next] += markov.conf * 2;
-    details.push({ src: "Markov", next: markov.next, conf: markov.conf });
-  }
-
-  // Luồng sóng (weight 1)
-  const luong = algoLuong(seq);
-  if (luong) {
-    votes[luong.next] += 1;
-    weights[luong.next] += luong.conf;
-    details.push({ src: "Sóng", next: luong.next, conf: luong.conf });
-  }
-
-  // Dice distribution (weight 1)
-  const dice = algoDice(hist);
-  if (dice) {
-    votes[dice.next] += 1;
-    weights[dice.next] += dice.conf;
-    details.push({ src: "Xúc Xắc", next: dice.next, conf: dice.conf });
-  }
+  add(pat, 3);
+  add(algoFrequency(seq), 2);
+  add(algoMarkov(seq), 2);
+  add(algoLuong(seq), 1);
+  add(algoDice(hist), 1);
+  add(algoStreak5(seq), 1);
 
   const totalT = weights["T"] || 0;
   const totalX = weights["X"] || 0;
+  const total = totalT + totalX;
 
-  let next, finalConf;
-  if (totalT === 0 && totalX === 0) {
-    next = Math.random() > 0.5 ? "T" : "X";
-    finalConf = 0.5;
-  } else {
-    const total = totalT + totalX;
-    if (totalT >= totalX) {
-      next = "T";
-      finalConf = totalT / total;
-    } else {
-      next = "X";
-      finalConf = totalX / total;
-    }
+  let next = "T", finalConf = 0.5;
+  if (total > 0) {
+    if (totalT >= totalX) { next = "T"; finalConf = totalT / total; }
+    else { next = "X"; finalConf = totalX / total; }
   }
 
-  const patternStr = seq.slice(0, 10).join("");
+  const patternStr = seq.slice(0, 12).join("");
+  const cauType = pat ? pat.name : votes["T"] > votes["X"] ? "Nghiêng Tài" : votes["X"] > votes["T"] ? "Nghiêng Xỉu" : "Lộn Xộn";
 
-  let cauType = "Lộn Xộn";
-  if (pat) cauType = pat.name;
-  else if (votes["T"] > votes["X"]) cauType = "Nghiêng Tài";
-  else if (votes["X"] > votes["T"]) cauType = "Nghiêng Xỉu";
-
-  return {
-    next: next === "T" ? "Tài" : "Xỉu",
-    conf: Math.round(Math.min(finalConf, 0.92) * 100),
-    cauType,
-    pattern: patternStr,
-    detail: details,
-  };
+  return { next: next === "T" ? "Tài" : "Xỉu", conf: Math.round(Math.min(finalConf, 0.92) * 100), cauType, pattern: patternStr };
 }
 
-// ─── Sync History ─────────────────────────────────────────────────────────────
+// ─── Sync ─────────────────────────────────────────────────────────────────────
+let lastDebug = null;
+
 async function syncHistory() {
   try {
-    const data = await fetchSource();
-    // Support various response shapes
-    const sessions =
-      data.data?.sessions ??
-      data.sessions ??
-      data.data ??
-      (Array.isArray(data) ? data : []);
+    const result = await fetchSource();
+    lastDebug = result;
+    if (result.parseError) return;
+    const sessions = extractSessions(result.body);
     if (!sessions.length) return;
     const parsed = buildHistory(sessions);
-    // Merge new entries
-    const existing = new Set(history.map((h) => String(h.phien)));
+    const existing = new Set(history.map((h) => h.phien));
     for (const item of parsed) {
-      if (!existing.has(String(item.phien))) history.unshift(item);
+      if (!existing.has(item.phien)) history.unshift(item);
     }
-    // Keep most recent HISTORY_LIMIT
     if (history.length > HISTORY_LIMIT) history = history.slice(0, HISTORY_LIMIT);
-  } catch (e) {
-    // silently skip
-  }
+  } catch (_) {}
 }
 
 // ─── HTTP Server ───────────────────────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  res.setHeader("Content-Type", "application/json");
+http.createServer(async (req, res) => {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Access-Control-Allow-Origin", "*");
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
-  if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Methods", "GET");
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  const url = new URL(req.url, "http://localhost");
 
-  const url = new URL(req.url, `http://localhost`);
-
-  // ── GET /predict ──────────────────────────────────────────────────────────
   if (url.pathname === "/predict" || url.pathname === "/") {
     await syncHistory();
-
     if (history.length === 0) {
       res.writeHead(503);
-      res.end(JSON.stringify({ error: "Chưa có dữ liệu" }));
+      res.end(JSON.stringify({ error: "Chưa có dữ liệu", hint: "Truy cập /debug để kiểm tra JSON nguồn" }));
       return;
     }
-
     const latest = history[0];
     const pred = predict(history);
-
-    const out = {
+    res.writeHead(200);
+    res.end(JSON.stringify({
       phien: latest.phien,
       xuc_xac: latest.dice,
-      phien_hien_tai: String(latest.phien),
+      phien_hien_tai: latest.phien,
       du_doan: pred.next,
-      do_tin_cay: `${pred.conf}%`,
+      do_tin_cay: pred.conf + "%",
       loai_cau: pred.cauType,
       pattern: pred.pattern,
-    };
-
-    res.writeHead(200);
-    res.end(JSON.stringify(out));
+    }));
     return;
   }
 
-  // ── GET /history ──────────────────────────────────────────────────────────
   if (url.pathname === "/history") {
     await syncHistory();
-    const limit = parseInt(url.searchParams.get("limit") || "20", 10);
-    const rows = history.slice(0, limit).map((h) => ({
-      phien: h.phien,
-      xuc_xac: h.dice,
-      tong: h.tong,
-      ket_qua: h.type === "T" ? "Tài" : "Xỉu",
-    }));
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "20", 10), 100);
     res.writeHead(200);
-    res.end(JSON.stringify({ total: rows.length, data: rows }));
+    res.end(JSON.stringify({
+      total: history.length,
+      data: history.slice(0, limit).map((h) => ({
+        phien: h.phien, xuc_xac: h.dice, tong: h.tong, ket_qua: h.type === "T" ? "Tài" : "Xỉu",
+      })),
+    }));
+    return;
+  }
+
+  // /debug — xem raw response từ nguồn để tìm cấu trúc JSON
+  if (url.pathname === "/debug") {
+    const result = await fetchSource().catch((e) => ({ error: e.message }));
+    res.writeHead(200);
+    res.end(JSON.stringify(result, null, 2));
     return;
   }
 
   res.writeHead(404);
   res.end(JSON.stringify({ error: "Not found" }));
-});
 
-server.listen(PORT, () => {
-  console.log(`API running on port ${PORT}`);
-  console.log(`  GET /predict  → dự đoán phiên tiếp theo`);
-  console.log(`  GET /history  → lịch sử gần nhất`);
+}).listen(PORT, () => {
+  console.log("API running on port " + PORT);
+  syncHistory();
+  setInterval(syncHistory, 15000);
 });
-
-// Auto-sync every 15 seconds
-setInterval(syncHistory, 15000);
-syncHistory();
